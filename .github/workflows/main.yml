@@ -1,0 +1,150 @@
+# installing required libraries
+# numerapi, for facilitating data download and predictions uploading
+# catboost, for modeling and making predictions
+!pip install numerapi
+!pip install catboost
+import os
+import gc
+import csv
+import glob
+import time
+from pathlib import Path
+
+import numerapi
+
+import scipy
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from catboost import CatBoostRegressor
+napi = numerapi.NumerAPI(verbosity="info")
+# download current dataset
+napi.download_current_dataset(unzip=True)
+
+current_ds = napi.get_current_round()
+latest_round = os.path.join('numerai_dataset_'+str(current_ds))
+TOURNAMENT_NAME = "nomi"
+TARGET_NAME = f"target"
+PREDICTION_NAME = f"prediction"
+
+BENCHMARK = 0
+BAND = 0.2
+
+#-----------------------------------------------------
+
+# Submissions are scored by spearman correlation
+def score(df):
+    # method="first" breaks ties based on order in array
+    return np.corrcoef(
+        df[TARGET_NAME],
+        df[PREDICTION_NAME].rank(pct=True, method="first")
+    )[0, 1]
+
+def correlation(predictions, targets):
+    ranked_preds = predictions.rank(pct=True, method="first")
+    return np.corrcoef(ranked_preds, targets)[0, 1]
+
+# The payout function
+def payout(scores):
+    return ((scores - BENCHMARK) / BAND).clip(lower=-1, upper=1)
+
+
+# Read the csv file into a pandas Dataframe
+def read_csv(file_path):
+    with open(file_path, 'r') as f:
+        column_names = next(csv.reader(f))
+        dtypes = {x: np.float16 for x in column_names if
+                  x.startswith(('feature', 'target'))}
+    return pd.read_csv(file_path, dtype=dtypes)
+    %%time
+print("# Loading data...")
+# The training data is used to train your model how to predict the targets.
+training_data = read_csv(os.path.join(latest_round, "numerai_training_data.csv")).set_index("id")
+# The tournament data is the data that Numerai uses to evaluate your model.
+tournament_data = read_csv(os.path.join(latest_round, "numerai_tournament_data.csv")).set_index("id")
+
+example_preds = read_csv(os.path.join(latest_round, "example_predictions.csv"))
+
+validation_data = tournament_data[tournament_data.data_type == "validation"]
+feature_names = [f for f in training_data.columns if f.startswith("feature")]
+print(f"Loaded {len(feature_names)} features")
+
+cols = feature_names+[TARGET_NAME]
+training_data.head()
+tournament_data.head()
+%%time
+MODEL_FILE = "example_model.cbm"
+
+params = {
+    'task_type': 'GPU'
+    }
+
+model = CatBoostRegressor(**params)
+
+if os.path.isfile(MODEL_FILE):
+    print("Loading pre-trained model...")
+    model.load_model(MODEL_FILE)
+else:
+    print("Training model...")
+    model.fit(training_data[feature_names].astype(np.float32), training_data[TARGET_NAME].astype(np.float32),
+         eval_set=(validation_data[feature_names].astype(np.float32), validation_data[TARGET_NAME].astype(np.float32))
+         )
+    model.save_model(MODEL_FILE)
+    %%time
+print("Generating predictions on training data...")
+training_preds = model.predict(training_data[feature_names].astype(np.float32))
+training_data[PREDICTION_NAME] = training_preds
+gc.collect()
+
+print("Generating predictions on tournament data...")
+tournament_preds = model.predict(tournament_data[feature_names].astype(np.float32))
+tournament_data[PREDICTION_NAME] = tournament_preds
+# Check the per-era correlations on the training set (in sample)
+train_correlations = training_data.groupby("era").apply(score)
+print(f"On training the correlation has mean {train_correlations.mean()} and std {train_correlations.std()}")
+print(f"On training the average per-era payout is {payout(train_correlations).mean()}")
+
+# Check the per-era correlations on the validation set (out of sample)
+validation_data = tournament_data[tournament_data.data_type == "validation"]
+validation_correlations = validation_data.groupby("era").apply(score)
+print(f"On validation the correlation has mean {validation_correlations.mean()} and "
+        f"std {validation_correlations.std()}")
+print(f"On validation the average per-era payout is {payout(validation_correlations).mean()}")
+# FEAT_EXPOSURE: How much your model is correlated to the features across era
+feature_exposures = validation_data[feature_names].apply(
+    lambda d: correlation(validation_data[PREDICTION_NAME], d), axis=0
+)
+max_per_era = validation_data.groupby("era").apply(
+    lambda d: d[feature_names].corrwith(d[PREDICTION_NAME]).abs().max()
+)
+max_feature_exposure = max_per_era.mean()
+print(f"Max Feature Exposure: {max_feature_exposure}")
+tournament_data[PREDICTION_NAME].to_csv(f"{TOURNAMENT_NAME}_{current_ds}_submission.csv")
+# NameOfYourAI
+# Add keys between the quotes
+public_id = "7ORO4PGZTHFRZLZ4OHBHPRBQFIXQXTCQ"
+secret_key = "OUF2NYEBHO4R3B3URMMHBG7MCCXBWR4LENRAZW54RWF5ZG4M3V3EEBG7BPI6LP34"
+model_id = "0004"
+napi = numerapi.NumerAPI(public_id=public_id, secret_key=secret_key)
+submission_id = napi.upload_predictions(f"{TOURNAMENT_NAME}_{current_ds}_submission.csv", model_id=model_id)
+# Import PyDrive and associated libraries.
+# This only needs to be done once per notebook.
+from pydrive.auth import GoogleAuth
+from pydrive.drive import GoogleDrive
+from google.colab import auth
+from oauth2client.client import GoogleCredentials
+
+# Authenticate and create the PyDrive client.
+# This only needs to be done once per notebook.
+auth.authenticate_user()
+gauth = GoogleAuth()
+gauth.credentials = GoogleCredentials.get_application_default()
+drive = GoogleDrive(gauth)
+
+# Download a file based on its file ID.
+#
+# A file ID looks like: laggVyWshwcyP6kEI-y_W3P8D26sz
+file_id = 'Numerai0004'
+downloaded = drive.CreateFile({'id': file_id})
+print('Downloaded content "{}"'.format(downloaded.GetContentString()))
